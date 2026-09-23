@@ -1,0 +1,19 @@
+{
+  "id": "interrupt-demo",
+  "concurrency": 1,
+  "observe_rounds": 1,
+  "resume_policy": "resume",
+  "targets": [
+    {
+      "id": "t1",
+      "inject": { "kind": "sleep", "timeout": 10000000000,
+                  "params": { "duration": "8s", "flag": "t1/x" } },
+      "cleanup": { "kind": "set-flag", "timeout": 1000000000,
+                   "params": { "key": "t1/x", "value": "false" } },
+      "probes": [
+        { "name": "p", "kind": "flag", "key": "t1/x",
+          "timeout": 1000000000, "want": true, "min_hits": 1 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "id": "steady-demo",
+  "concurrency": 2,
+  "observe_every": 10000000,
+  "observe_rounds": 2,
+  "resume_policy": "resume",
+  "targets": [
+    {
+      "id": "alpha",
+      "inject": { "kind": "set-flag", "timeout": 500000000,
+                  "params": { "key": "alpha/injected", "value": "true" } },
+      "cleanup": { "kind": "set-flag", "timeout": 500000000,
+                   "params": { "key": "alpha/injected", "value": "false" } },
+      "probes": [
+        { "name": "alpha-flag", "kind": "flag", "key": "alpha/injected",
+          "timeout": 500000000, "want": true, "min_hits": 2 }
+      ]
+    },
+    {
+      "id": "beta",
+      "inject": { "kind": "set-flag", "timeout": 500000000,
+                  "params": { "key": "beta/svc", "value": "false" } },
+      "cleanup": { "kind": "set-flag", "timeout": 500000000,
+                   "params": { "key": "beta/svc", "value": "true" } },
+      "heal": {
+        "max_attempts": 2,
+        "action": { "kind": "set-flag", "timeout": 500000000,
+                    "params": { "key": "beta/svc", "value": "true" } }
+      },
+      "probes": [
+        { "name": "beta-svc", "kind": "flag", "key": "beta/svc",
+          "timeout": 500000000, "want": true, "min_hits": 2 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# 本地实验状态目录
+.chaos-state/
+*.tmp
+/orch
