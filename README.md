@@ -33,6 +33,8 @@ rm -f ./demo-state.json   # 删除状态文件 => 全新运行
 | `orchestrator/heal_sink.go` | 引擎侧回调：自愈动作去重触发、确定性复核 |
 | `orchestrator/store.go` | 状态持久化（JSON 原子写）与状态机守卫 |
 | `orchestrator/engine.go` | 编排引擎：并发上限、超时、取消、续跑、清理保证 |
+| `orchestrator/progress.go` | 运行期进度查询：不可变快照发布与一致视图 |
+| `orchestrator/supervisor.go` | 多计划并行：进程内隔离编排与重复发起规则 |
 | `cmd/demo/main.go` | 完全本地的演示程序 |
 
 ## 一、实验编排规则
@@ -166,10 +168,58 @@ RuleSpec{Probe, Metric, Operator, Threshold, MaxBreaches}
 - 最终 `Report` 对每个目标分别给出：阶段、判定结论、失败原因、失败详情、
   清理结果、自愈轮次，互不混淆。
 
-## 六、本地验证指引
+## 六、运行期进度查询
+
+计划在按并发上限执行时，外部可以随时查询进度，不必等整轮跑完：
+
+```go
+eng := orchestrator.NewEngine(exec, store)
+go eng.Run(ctx, plan)
+
+p := eng.Progress()               // 整个计划的一致快照
+tp, err := eng.TargetProgress("t01") // 单个目标
+```
+
+- 视图内容：每个目标当前的**阶段、稳态结论、自愈轮次、清理状态、
+  故障是否生效、最近事件**（尾部最多 `ProgressEventLimit` 条，序号连续），
+  以及计划级状态（`not_started / running / finished`）。
+- **一致性保证**：快照在每次状态提交（持久化成功）后以深拷贝整体发布，
+  查询读到的是同一时刻的完整视图——不会出现阶段与结论对不上、
+  事件缺一段、或读到写了一半的内容；同一协程连续查询，阶段单调不回退。
+- **零干扰**：查询只做原子加载，不抢执行路径的状态锁，
+  任意频率的查询都不会拖慢、阻塞或改变实验结果（有并发查询对拍测试兜底）。
+
+## 七、多计划并行运行
+
+`Supervisor` 支持在同一进程内同时跑多个计划，各跑各的、互不干扰：
+
+```go
+sup := orchestrator.NewSupervisor(stateRootDir, func(plan *orchestrator.Plan) orchestrator.Executor {
+    return newExecutorFor(plan) // 每个计划独立的执行器
+})
+_ = sup.Start(ctx, planA) // 异步启动；stateRootDir/<plan-id>/state.json 各自落盘
+_ = sup.Start(ctx, planB)
+p, _ := sup.Progress("plan-a") // 运行中随时查某个计划
+repA, _ := sup.Wait("plan-a")  // 阻塞等某个计划结束
+```
+
+隔离与兼容范围：
+
+- 每个计划有独立的 `Engine`、状态机、事件流与落盘位置
+  （`dir/<plan-id>/state.json`）；并发上限只约束本计划目标，
+  一个计划超时/取消/失败不影响其他计划；
+- **同一计划重复 `Start`**：进行中 → 明确拒绝 `ErrPlanAlreadyRunning`
+  （绝不出现两份运行同时写同一份状态）；上一轮已结束 → 允许再次发起，
+  按既有续跑规则从持久化状态继续（终态目标不重放）；
+- 计划 ID 必须能安全映射为独立目录（拒绝 `..`、路径分隔符等），
+  防止两个计划因路径解析共享同一份状态文件；
+- 兼容范围限定为**同一进程内**由 `Supervisor` 管理的并行；
+  两个进程同时写同一个状态文件不在保障范围内。
+
+## 八、本地验证指引
 
 ```bash
-# 1) 确定性全量测试（41 个用例，覆盖下列异常链路）
+# 1) 确定性全量测试（52 个用例，覆盖下列异常链路）
 go test ./... -race -count=1 -v
 
 # 2) 演示程序
@@ -184,7 +234,13 @@ go run ./cmd/demo -state ./demo-state.json
 - 清理始终失败 → `cleanup_failed`（含 3 次尝试审计）；
 - 整体超时 / 父 ctx 取消后清理仍执行，且原因可区分；
 - 并发上限实测（barrier 执行器）、内存/文件两种存储的中断恢复、
-  终态不重放、自愈动作恢复时不重复触发、外来计划状态拒绝。
+  终态不重放、自愈动作恢复时不重复触发、外来计划状态拒绝；
+- 运行期进度查询：运行前/运行中/高频并发查询下的快照一致性
+  （事件序号连续、阶段与结论对得上、阶段不回退、查询不改变结果）；
+- 多计划并行：三计划并行结论隔离、进行中重复发起明确拒绝、
+  结束后按续跑规则继续、非法计划 ID 拒绝、单计划超时不外溢；
+- CI 规模场景：3 计划并行 × 16 目标满并发 + 全程持续查询，
+  结果与同计划顺序跑逐目标一致（真实文件落盘，race 检测通过）。
 
 也可以通过修改 `cmd/demo/main.go` 中 `Script` 的字段自行构造场景：
 `Unreachable`、`DoFail`、`DoDelay`（配合短超时复现超时）、`ProbeFail`、
