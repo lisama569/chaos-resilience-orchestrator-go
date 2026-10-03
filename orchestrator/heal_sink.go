@@ -64,12 +64,12 @@ func (s *healSink) Recheck(round int) (*Evaluation, error) {
 		return nil, err
 	}
 	s.last = ev
-	s.st.Verdict = ev.Verdict
 	s.engine.logf("[target=%s] heal recheck round=%d verdict=%s basis=%s", s.spec.ID, round+1, ev.Verdict, ev.BasisSummary)
 	s.engine.event(s.spec.ID, "heal_rechecked", map[string]any{
 		"round": round + 1, "verdict": string(ev.Verdict), "basis": ev.BasisSummary,
 	})
 	if merr := s.engine.mutate(func() {
+		s.st.Verdict = ev.Verdict
 		_ = s.st.MarkDone(fmt.Sprintf("heal:%d:recheck", round), s.st.AttemptID, s.engine.now())
 	}); merr != nil {
 		return nil, merr

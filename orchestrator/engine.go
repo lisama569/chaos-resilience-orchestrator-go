@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,11 @@ type Engine struct {
 
 	stateMu sync.Mutex
 	state   *PlanState
+
+	// snapshot 是最近一次成功提交后发布的不可变状态深拷贝，
+	// 供运行期进度查询原子读取，查询路径不加锁、不阻塞执行。
+	snapshot  atomic.Pointer[PlanState]
+	runStatus atomic.Value // RunStatus
 }
 
 // Option 配置引擎。
@@ -58,6 +64,7 @@ func NewEngine(exec Executor, store Store, opts ...Option) *Engine {
 		o(e)
 	}
 	e.evaluator = NewEvaluator(e.now)
+	e.runStatus.Store(RunNotStarted)
 	return e
 }
 
@@ -67,6 +74,7 @@ func (e *Engine) newAttemptID(planID string) string {
 }
 
 // mutate 在持锁状态下修改状态并立即持久化，保证崩溃恢复边界清晰。
+// 持久化成功后发布新的不可变进度快照，供运行期查询一致地读取。
 func (e *Engine) mutate(fn func()) error {
 	e.stateMu.Lock()
 	defer e.stateMu.Unlock()
@@ -74,6 +82,7 @@ func (e *Engine) mutate(fn func()) error {
 	if err := e.store.Save(e.state); err != nil {
 		return fmt.Errorf("%w: %v", ErrPersistFailed, err)
 	}
+	e.publishSnapshot()
 	return nil
 }
 
@@ -127,6 +136,8 @@ func (e *Engine) Run(ctx context.Context, plan *Plan) (*Report, error) {
 		}
 	}
 	e.state = loaded
+	e.runStatus.Store(RunRunning)
+	defer e.runStatus.Store(RunFinished)
 	e.event("", "run_started", map[string]any{"plan_id": plan.ID, "attempt_id": loaded.AttemptID, "targets": len(plan.Targets)})
 
 	runCtx := ctx
@@ -175,10 +186,10 @@ func (e *Engine) runTarget(ctx context.Context, spec TargetSpec) TargetResult {
 		// 规则 2：故障已注入但进程中断过。崩溃点不可安全复现，只清理并中止。
 		e.logf("[target=%s] resume detected: fault was injected before interruption; cleanup-only then abort", spec.ID)
 		e.event(spec.ID, "resume_interrupted", map[string]any{"phase": string(st.Phase)})
-		st.Failure = ReasonInterrupted
-		st.FailureDetail = "process restarted after fault injection; experiment aborted, fault cleanup enforced"
 		cleanup := e.enforceCleanup(ctx, spec, st)
 		_ = e.mutate(func() {
+			st.Failure = ReasonInterrupted
+			st.FailureDetail = "process restarted after fault injection; experiment aborted, fault cleanup enforced"
 			st.Cleanup = cleanup
 			st.UpdatedAt = e.now()
 			if cleanup == CleanupFailed {
@@ -250,7 +261,7 @@ func (e *Engine) runFresh(ctx context.Context, spec TargetSpec, st *TargetState)
 	e.event(spec.ID, "steady_evaluated", map[string]any{
 		"verdict": string(ev.Verdict), "round": ev.Round, "basis": ev.BasisSummary,
 	})
-	st.Verdict = ev.Verdict
+	_ = e.mutate(func() { st.Verdict = ev.Verdict })
 
 	switch ev.Verdict {
 	case VerdictSteady:
