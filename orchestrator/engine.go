@@ -27,6 +27,7 @@ type Engine struct {
 
 	stateMu sync.Mutex
 	state   *PlanState
+	running bool // 是否有正在执行的动作（供运行期进度查询）
 }
 
 // Option 配置引擎。
@@ -126,7 +127,10 @@ func (e *Engine) Run(ctx context.Context, plan *Plan) (*Report, error) {
 			loaded.Targets[t.ID] = &TargetState{ID: t.ID, AttemptID: loaded.AttemptID, Cleanup: CleanupNotNeeded}
 		}
 	}
+	e.stateMu.Lock()
 	e.state = loaded
+	e.running = true
+	e.stateMu.Unlock()
 	e.event("", "run_started", map[string]any{"plan_id": plan.ID, "attempt_id": loaded.AttemptID, "targets": len(plan.Targets)})
 
 	runCtx := ctx
@@ -150,6 +154,7 @@ func (e *Engine) Run(ctx context.Context, plan *Plan) (*Report, error) {
 	}
 	wg.Wait()
 	e.event("", "run_finished", nil)
+	_ = e.mutate(func() { e.running = false })
 
 	report := &Report{PlanID: plan.ID, At: e.now(), Results: results}
 	if runCtx.Err() != nil {
@@ -175,8 +180,10 @@ func (e *Engine) runTarget(ctx context.Context, spec TargetSpec) TargetResult {
 		// 规则 2：故障已注入但进程中断过。崩溃点不可安全复现，只清理并中止。
 		e.logf("[target=%s] resume detected: fault was injected before interruption; cleanup-only then abort", spec.ID)
 		e.event(spec.ID, "resume_interrupted", map[string]any{"phase": string(st.Phase)})
-		st.Failure = ReasonInterrupted
-		st.FailureDetail = "process restarted after fault injection; experiment aborted, fault cleanup enforced"
+		_ = e.mutate(func() {
+			st.Failure = ReasonInterrupted
+			st.FailureDetail = "process restarted after fault injection; experiment aborted, fault cleanup enforced"
+		})
 		cleanup := e.enforceCleanup(ctx, spec, st)
 		_ = e.mutate(func() {
 			st.Cleanup = cleanup
@@ -250,7 +257,7 @@ func (e *Engine) runFresh(ctx context.Context, spec TargetSpec, st *TargetState)
 	e.event(spec.ID, "steady_evaluated", map[string]any{
 		"verdict": string(ev.Verdict), "round": ev.Round, "basis": ev.BasisSummary,
 	})
-	st.Verdict = ev.Verdict
+	_ = e.mutate(func() { st.Verdict = ev.Verdict })
 
 	switch ev.Verdict {
 	case VerdictSteady:

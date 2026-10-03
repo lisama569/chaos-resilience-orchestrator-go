@@ -64,7 +64,7 @@ func (s *healSink) Recheck(round int) (*Evaluation, error) {
 		return nil, err
 	}
 	s.last = ev
-	s.st.Verdict = ev.Verdict
+	_ = s.engine.mutate(func() { s.st.Verdict = ev.Verdict })
 	s.engine.logf("[target=%s] heal recheck round=%d verdict=%s basis=%s", s.spec.ID, round+1, ev.Verdict, ev.BasisSummary)
 	s.engine.event(s.spec.ID, "heal_rechecked", map[string]any{
 		"round": round + 1, "verdict": string(ev.Verdict), "basis": ev.BasisSummary,
