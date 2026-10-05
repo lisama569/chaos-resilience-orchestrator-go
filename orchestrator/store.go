@@ -111,6 +111,25 @@ func (ps *PlanState) Target(id string) (*TargetState, error) {
 	return nil, fmt.Errorf("%w: %s", ErrUnknownTarget, id)
 }
 
+// deepCopy 返回整个计划状态的深拷贝（含目标、步骤、事件与事件详情）。
+// 用于把“待落盘的某一时刻状态”与“仍在被推进的活状态”解耦：
+// 落盘只持有这份拷贝，写盘期间活状态的继续变更不会混入本次写入，
+// 也不会被本次写入拖住。
+func (ps *PlanState) deepCopy() *PlanState {
+	if ps == nil {
+		return nil
+	}
+	cp := *ps
+	cp.Targets = make(map[string]*TargetState, len(ps.Targets))
+	for id, st := range ps.Targets {
+		t := *st
+		t.Done = append([]StepDone(nil), st.Done...)
+		t.Events = copyEvents(st.Events)
+		cp.Targets[id] = &t
+	}
+	return &cp
+}
+
 // AppendEvent 以单调递增序号追加审计事件。
 func (ps *PlanState) AppendEvent(at time.Time, targetID, kind string, detail map[string]any) Event {
 	ps.EventSeq++

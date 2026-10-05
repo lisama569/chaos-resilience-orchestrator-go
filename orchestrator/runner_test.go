@@ -225,7 +225,11 @@ func TestRunnerParallelPlansIsolation(t *testing.T) {
 
 	// 每个计划的状态文件必须独立存在且只含自己的目标。
 	for _, p := range []*Plan{planA, planB, planC} {
-		path := filepath.Join(dir, safeFileName(p.ID)+".state.json")
+		name, err := stateFileName(p.ID)
+		if err != nil {
+			t.Fatalf("state file name for %s: %v", p.ID, err)
+		}
+		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("state file for %s: %v", p.ID, err)
@@ -293,7 +297,8 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 	}
 
 	// 并行运行 + 持续查询。
-	r := NewRunner(NewSimExecutor(scripts), WithStateDir(t.TempDir()))
+	dir := t.TempDir()
+	r := NewRunner(NewSimExecutor(scripts), WithStateDir(dir))
 	ctx := context.Background()
 	for _, p := range plans {
 		if err := r.Start(ctx, p); err != nil {
@@ -382,5 +387,33 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 				t.Fatalf("plan %s target %s: non-terminal phase %s after run", p.ID, tp.TargetID, tp.Phase)
 			}
 		}
+
+		// 落盘状态必须与最终报告逐字段一致（落盘进度/结论与实际跑的对得上）。
+		name, err := stateFileName(p.ID)
+		if err != nil {
+			t.Fatalf("state file name for %s: %v", p.ID, err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read persisted state for %s: %v", p.ID, err)
+		}
+		var ps PlanState
+		if err := json.Unmarshal(data, &ps); err != nil {
+			t.Fatalf("persisted state for %s corrupt: %v", p.ID, err)
+		}
+		if ps.PlanID != p.ID {
+			t.Fatalf("state file %s belongs to %q, want %q", name, ps.PlanID, p.ID)
+		}
+		for _, res := range reps[p.ID].Results {
+			st, err := ps.Target(res.TargetID)
+			if err != nil {
+				t.Fatalf("plan %s: persisted state missing target %s", p.ID, res.TargetID)
+			}
+			disk := resultKey{st.Phase, st.Verdict, st.Failure, st.Cleanup, st.HealRounds}
+			if disk != keyOf(res) {
+				t.Fatalf("plan %s target %s: persisted=%+v report=%+v", p.ID, res.TargetID, disk, keyOf(res))
+			}
+		}
+		t.Logf("plan %s: persisted state matches report for all %d targets", p.ID, len(p.Targets))
 	}
 }

@@ -28,6 +28,11 @@ type Engine struct {
 	stateMu sync.Mutex
 	state   *PlanState
 	running bool // 是否有正在执行的动作（供运行期进度查询）
+
+	// persistMu 序列化落盘写，保证盘上状态按变更顺序推进、绝不倒退。
+	// 锁顺序固定为 stateMu → persistMu；进度查询只经过 stateMu，
+	// 因此查询永远不被写盘 I/O 阻塞，写盘也不被查询阻塞。
+	persistMu sync.Mutex
 }
 
 // Option 配置引擎。
@@ -67,12 +72,23 @@ func (e *Engine) newAttemptID(planID string) string {
 	return fmt.Sprintf("%s#%d", planID, e.now().UnixNano())
 }
 
-// mutate 在持锁状态下修改状态并立即持久化，保证崩溃恢复边界清晰。
+// mutate 修改状态并持久化，保证崩溃恢复边界清晰。
+//
+// 实现要点（查询与执行互不拖累的关键）：
+//  1. stateMu 内只做内存操作：应用变更 + 深拷贝出本次待落盘的快照，
+//     不做任何 I/O，因此 Snapshot 只需等一段纯内存拷贝；
+//  2. persistMu 在释放 stateMu 之前按同一顺序取得，保证多并发变更的
+//     落盘顺序与内存变更顺序一致，盘上状态绝不倒退；
+//  3. 真正的写盘 I/O 只持有 persistMu，不持有 stateMu，
+//     因此写盘期间查询照常立刻返回，查询再频繁也不参与执行排序。
 func (e *Engine) mutate(fn func()) error {
 	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
 	fn()
-	if err := e.store.Save(e.state); err != nil {
+	pending := e.state.deepCopy()
+	e.persistMu.Lock()
+	e.stateMu.Unlock()
+	defer e.persistMu.Unlock()
+	if err := e.store.Save(pending); err != nil {
 		return fmt.Errorf("%w: %v", ErrPersistFailed, err)
 	}
 	return nil
