@@ -225,8 +225,11 @@ func TestRunnerParallelPlansIsolation(t *testing.T) {
 
 	// 每个计划的状态文件必须独立存在且只含自己的目标。
 	for _, p := range []*Plan{planA, planB, planC} {
-		path := filepath.Join(dir, safeFileName(p.ID)+".state.json")
-		data, err := os.ReadFile(path)
+		abs, _, err := planStateLocation(dir, p.ID)
+		if err != nil {
+			t.Fatalf("state location for %s: %v", p.ID, err)
+		}
+		data, err := os.ReadFile(abs)
 		if err != nil {
 			t.Fatalf("state file for %s: %v", p.ID, err)
 		}
@@ -235,7 +238,7 @@ func TestRunnerParallelPlansIsolation(t *testing.T) {
 			t.Fatalf("state file for %s corrupt: %v", p.ID, err)
 		}
 		if ps.PlanID != p.ID {
-			t.Fatalf("state file %s belongs to %s", path, ps.PlanID)
+			t.Fatalf("state file %s belongs to %s", abs, ps.PlanID)
 		}
 		if len(ps.Targets) != len(p.Targets) {
 			t.Fatalf("plan %s: state has %d targets, want %d", p.ID, len(ps.Targets), len(p.Targets))
@@ -260,18 +263,56 @@ func TestRunnerParallelPlansIsolation(t *testing.T) {
 			t.Fatalf("plan-c target %s: want %+v, got %+v", id, w, got[id])
 		}
 	}
+
+	// plan-a 含全部 16 个目标：满并发下每个目标的阶段/结论/原因/清理都必须
+	// 与单独顺序运行逐字段一致；失败目标必须给出具体原因与详情，不得含糊。
+	refRunner := NewRunner(NewSimExecutor(scripts), WithStateDir(filepath.Join(t.TempDir(), "ref")))
+	refRep, err := refRunner.Run(context.Background(), planA)
+	if err != nil {
+		t.Fatalf("sequential reference run: %v", err)
+	}
+	gotA, wantA := resultsByID(reps["plan-a"]), resultsByID(refRep)
+	for id, w := range wantA {
+		if gotA[id] != w {
+			t.Fatalf("plan-a target %s differs under parallelism: parallel=%+v sequential=%+v",
+				id, gotA[id], w)
+		}
+	}
+	resByID := map[string]TargetResult{}
+	for _, res := range reps["plan-a"].Results {
+		resByID[res.TargetID] = res
+	}
+	for _, id := range []string{"t14", "t15"} {
+		res := resByID[id]
+		if res.FailureDetail == "" {
+			t.Fatalf("target %s: aborted without concrete failure detail", id)
+		}
+		if res.Cleanup != CleanupNotNeeded {
+			t.Fatalf("target %s: fault never injected, cleanup must be not_needed, got %s", id, res.Cleanup)
+		}
+		t.Logf("[failure-boundary] target %s phase=%s reason=%s detail=%q cleanup=%s",
+			id, res.Phase, res.Failure, res.FailureDetail, res.Cleanup)
+	}
+	for id := 0; id <= 13; id++ {
+		tid := fmt.Sprintf("t%02d", id)
+		if resByID[tid].Phase != PhaseCompleted {
+			t.Fatalf("target %s: expected completed, got %+v", tid, resByID[tid])
+		}
+	}
+	t.Logf("[failure-boundary] plan-a: all 16 targets field-identical to sequential run under concurrency=16")
 }
 
 // TestRunnerHighConcurrencyWithQueries CI 级场景：
-// 3 个计划并行（其中一个 16 目标、并发上限拉满），运行期间多 goroutine
-// 持续查询进度；全部结束后，每个目标的结果与单独顺序运行完全一致。
-// 状态全部真实落盘（t.TempDir 下的 FileStore）。
+// 3 个计划并行（其中一个 16 目标、并发上限拉满，且计划 ID 含斜杠/空格/中文），
+// 运行期间每计划多个 goroutine 高频查询进度；全部结束后，每个目标的阶段、
+// 结论、失败原因、清理结果、自愈轮次与事件序列都必须与单独顺序运行逐字段一致。
+// 状态全部真实落盘（t.TempDir 下的 FileStore），不使用内存桩。
 func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
-	planA, scriptsA := mixedPlan("ci-a", 16)
-	planB, scriptsB := mixedPlan("ci-b", 4)
+	planA, scriptsA := mixedPlan("ci/生产 订单#1", 16) // 16 目标，并发上限拉满
+	planB, scriptsB := mixedPlan("ci-灰度.2", 4)
 	planB.Targets = planB.Targets[:6]
-	planC, scriptsC := mixedPlan("ci-c", 8)
-	planC.Targets = planC.Targets[10:]
+	planC, scriptsC := mixedPlan(`ci\回归_3`, 8)
+	planC.Targets = planC.Targets[10:] // 自愈收敛 + 违例组合
 	plans := []*Plan{planA, planB, planC}
 
 	scripts := map[string]*Script{}
@@ -283,13 +324,15 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 	ref := map[string]*Report{}
 	refKinds := map[string]map[string][]string{}
 	for i, p := range plans {
-		r := NewRunner(NewSimExecutor(scripts), WithStateDir(filepath.Join(t.TempDir(), fmt.Sprintf("ref-%d", i))))
-		rep, err := r.Run(context.Background(), p)
+		rep, err := NewRunner(NewSimExecutor(scripts),
+			WithStateDir(filepath.Join(t.TempDir(), fmt.Sprintf("ref-%d", i)))).
+			Run(context.Background(), p)
 		if err != nil {
 			t.Fatalf("reference run %s: %v", p.ID, err)
 		}
 		ref[p.ID] = rep
 		refKinds[p.ID] = eventKinds(rep)
+		t.Logf("[reference] plan=%q targets=%d", p.ID, len(rep.Results))
 	}
 
 	// 并行运行 + 持续查询。
@@ -297,19 +340,25 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 	ctx := context.Background()
 	for _, p := range plans {
 		if err := r.Start(ctx, p); err != nil {
-			t.Fatalf("start %s: %v", p.ID, err)
+			t.Fatalf("start %q: %v", p.ID, err)
 		}
 	}
 
 	var queryWG sync.WaitGroup
 	stopQuery := make(chan struct{})
-	var queryCount int64
-	var mu sync.Mutex
+	queryCounts := map[string]int64{}
+	var countMu sync.Mutex
 	for _, p := range plans {
-		for q := 0; q < 2; q++ { // 每个计划两个并发查询者
+		for q := 0; q < 3; q++ { // 每个计划三个并发高频查询者
 			queryWG.Add(1)
-			go func(planID string) {
+			go func(planID string, worker int) {
 				defer queryWG.Done()
+				var n int64
+				defer func() {
+					countMu.Lock()
+					queryCounts[planID] += n
+					countMu.Unlock()
+				}()
 				for {
 					select {
 					case <-stopQuery:
@@ -318,15 +367,13 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 					}
 					prog, err := r.Progress(planID)
 					if err != nil {
-						t.Errorf("progress %s: %v", planID, err)
+						t.Errorf("progress %s worker %d: %v", planID, worker, err)
 						return
 					}
 					checkSnapshotInvariants(t, prog)
-					mu.Lock()
-					queryCount++
-					mu.Unlock()
+					n++
 				}
-			}(p.ID)
+			}(p.ID, q)
 		}
 	}
 
@@ -334,53 +381,209 @@ func TestRunnerHighConcurrencyWithQueries(t *testing.T) {
 	for _, p := range plans {
 		rep, err := r.Wait(p.ID)
 		if err != nil {
-			t.Fatalf("wait %s: %v", p.ID, err)
+			t.Fatalf("wait %q: %v", p.ID, err)
 		}
 		reps[p.ID] = rep
 	}
 	close(stopQuery)
 	queryWG.Wait()
-	t.Logf("completed %d concurrent progress queries", queryCount)
-	if queryCount == 0 {
-		t.Fatal("no progress query executed during parallel run")
+	var totalQueries int64
+	for id, n := range queryCounts {
+		if n == 0 {
+			t.Fatalf("plan %q had no progress query during the run", id)
+		}
+		totalQueries += n
+		t.Logf("[queries] plan=%q queries=%d", id, n)
 	}
+	t.Logf("[queries] total concurrent read-only progress queries=%d", totalQueries)
 
-	// 并行 + 查询下的结果必须与单独顺序运行一致（结论与事件序列都一致）。
+	// 逐计划比对：并行 + 高频查询下的结果必须与单独顺序运行完全一致。
 	for _, p := range plans {
-		got, want := resultsByID(reps[p.ID]), resultsByID(ref[p.ID])
-		if len(got) != len(want) {
-			t.Fatalf("plan %s: got %d results, want %d", p.ID, len(got), len(want))
-		}
-		for id, w := range want {
-			if got[id] != w {
-				t.Fatalf("plan %s target %s: parallel=%+v sequential=%+v", p.ID, id, got[id], w)
+		pid := p.ID
+		t.Run("parity/"+pid, func(t *testing.T) {
+			got, want := resultsByID(reps[pid]), resultsByID(ref[pid])
+			if len(got) != len(want) {
+				t.Fatalf("got %d results, want %d", len(got), len(want))
 			}
-		}
-		gotKinds, wantKinds := eventKinds(reps[p.ID]), refKinds[p.ID]
-		for id, wk := range wantKinds {
-			gk := gotKinds[id]
-			if len(gk) != len(wk) {
-				t.Fatalf("plan %s target %s: event count %d != sequential %d (%v vs %v)",
-					p.ID, id, len(gk), len(wk), gk, wk)
-			}
-			for i := range wk {
-				if gk[i] != wk[i] {
-					t.Fatalf("plan %s target %s: event #%d %s != sequential %s", p.ID, id, i, gk[i], wk[i])
+			for id, w := range want {
+				if got[id] != w {
+					t.Fatalf("target %s: parallel=%+v sequential=%+v", id, got[id], w)
 				}
 			}
+			gotKinds, wantKinds := eventKinds(reps[pid]), refKinds[pid]
+			for id, wk := range wantKinds {
+				gk := gotKinds[id]
+				if len(gk) != len(wk) {
+					t.Fatalf("target %s: event count %d != sequential %d", id, len(gk), len(wk))
+				}
+				for i := range wk {
+					if gk[i] != wk[i] {
+						t.Fatalf("target %s: event #%d %s != sequential %s", id, i, gk[i], wk[i])
+					}
+				}
+			}
+			// 结束后进度视图必须为终态一致视图。
+			prog, err := r.Progress(pid)
+			if err != nil {
+				t.Fatalf("final progress: %v", err)
+			}
+			if prog.Running {
+				t.Fatalf("plan still running after wait")
+			}
+			for _, tp := range prog.Targets {
+				if !tp.Phase.IsTerminal() {
+					t.Fatalf("target %s non-terminal phase %s after run", tp.TargetID, tp.Phase)
+				}
+			}
+			t.Logf("[parity] plan=%q targets=%d fields+events identical to sequential run, queries=%d",
+				pid, len(want), queryCounts[pid])
+		})
+	}
+}
+
+// TestRunnerExoticPlanIDsIsolatedOnDisk 覆盖业务：计划 ID 含斜杠、空格、
+// 中文（旧的文件名安全化会把它们全部撞成同一文件）时，并行运行仍必须各自
+// 落盘、状态互不污染、重启续跑读到的是自己的状态。全程真实 FileStore。
+func TestRunnerExoticPlanIDsIsolatedOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	// 旧规则下 "prod/a b"、"prod/a.b"、"prod/a_b" 都会被压成同一文件名，
+	// 是最容易复现“两份运行写同一处”的一组 ID。
+	planX, scriptsX := mixedPlan("prod/订单 svc", 16)
+	planY, scriptsY := mixedPlan("prod/订单.svc", 8)
+	planY.Targets = planY.Targets[:6]
+	planZ, scriptsZ := mixedPlan(`prod\订单_svc`, 4)
+	planZ.Targets = planZ.Targets[12:]
+	plans := []*Plan{planX, planY, planZ}
+
+	scripts := map[string]*Script{}
+	mergeScripts(scripts, scriptsX)
+	mergeScripts(scripts, scriptsY)
+	mergeScripts(scripts, scriptsZ)
+
+	r := NewRunner(NewSimExecutor(scripts), WithStateDir(dir))
+	for _, p := range plans {
+		if err := r.Start(context.Background(), p); err != nil {
+			t.Fatalf("start %q: %v", p.ID, err)
 		}
-		// 结束后进度视图必须为终态一致视图。
-		prog, err := r.Progress(p.ID)
+	}
+	for _, p := range plans {
+		rep, err := r.Wait(p.ID)
 		if err != nil {
-			t.Fatalf("final progress %s: %v", p.ID, err)
+			t.Fatalf("wait %q: %v", p.ID, err)
 		}
-		if prog.Running {
-			t.Fatalf("plan %s still running after wait", p.ID)
+		if len(rep.Results) != len(p.Targets) {
+			t.Fatalf("plan %q: got %d results, want %d", p.ID, len(rep.Results), len(p.Targets))
 		}
-		for _, tp := range prog.Targets {
-			if !tp.Phase.IsTerminal() {
-				t.Fatalf("plan %s target %s: non-terminal phase %s after run", p.ID, tp.TargetID, tp.Phase)
+	}
+
+	// 三个不同 ID 必须对应三个不同的状态文件，且文件内 plan_id 与目标数都对得上。
+	paths := map[string]bool{}
+	for _, p := range plans {
+		abs, _, err := planStateLocation(dir, p.ID)
+		if err != nil {
+			t.Fatalf("location %q: %v", p.ID, err)
+		}
+		if paths[abs] {
+			t.Fatalf("plan %q shares state file with another plan: %s", p.ID, abs)
+		}
+		paths[abs] = true
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			t.Fatalf("read state for %q: %v", p.ID, err)
+		}
+		var ps PlanState
+		if err := json.Unmarshal(data, &ps); err != nil {
+			t.Fatalf("corrupt state for %q: %v", p.ID, err)
+		}
+		if ps.PlanID != p.ID {
+			t.Fatalf("state file %s belongs to %q, want %q", abs, ps.PlanID, p.ID)
+		}
+		if len(ps.Targets) != len(p.Targets) {
+			t.Fatalf("plan %q: state has %d targets, want %d", p.ID, len(ps.Targets), len(p.Targets))
+		}
+		t.Logf("plan %q -> %s (%d targets, isolated)", p.ID, filepath.Base(abs), len(ps.Targets))
+	}
+
+	// 用全新 Runner 指向同一目录续跑：每个计划必须读到自己的终态，
+	// 全部走“终态跳过”，不执行任何动作，且结论字段不回退。
+	exec := &countingExecutor{inner: NewSimExecutor(scripts)}
+	r2 := NewRunner(exec, WithStateDir(dir))
+	for _, p := range plans {
+		rep, err := r2.Run(context.Background(), p)
+		if err != nil {
+			t.Fatalf("resume %q: %v", p.ID, err)
+		}
+		for _, res := range rep.Results {
+			if !res.Phase.IsTerminal() {
+				t.Fatalf("plan %q target %s lost terminal state on resume: %s", p.ID, res.TargetID, res.Phase)
 			}
 		}
+	}
+	if len(exec.doCommands) != 0 {
+		t.Fatalf("resume re-executed actions on foreign/own state: %v", exec.doCommands)
+	}
+	t.Logf("resume of %d exotic-id plans executed 0 actions (each read its own state)", len(plans))
+}
+
+// TestRunnerLocationConflictRejected 自定义工厂把两个不同计划 ID 映射到
+// 同一落点时，第二个计划必须在发起阶段被明确拒绝，绝不允许两份运行共用状态。
+func TestRunnerLocationConflictRejected(t *testing.T) {
+	dir := t.TempDir()
+	shared := filepath.Join(dir, "shared.state.json")
+	factory := func(planID string) (Store, string, error) {
+		return NewFileStore(shared), shared, nil
+	}
+	r := NewRunner(NewSimExecutor(simScripts(nil)), WithStoreFactory(factory))
+
+	planA := testPlan(testTarget("t1", false))
+	planA.ID = "plan-a"
+	if err := r.Start(context.Background(), planA); err != nil {
+		t.Fatalf("first plan should start: %v", err)
+	}
+	// 不同 ID、同一落点：即使前一个仍在运行，也必须先报落点冲突。
+	planB := testPlan(testTarget("t2", false))
+	planB.ID = "plan-b"
+	err := r.Start(context.Background(), planB)
+	if !errors.Is(err, ErrPlanLocationConflict) {
+		t.Fatalf("want ErrPlanLocationConflict, got %v", err)
+	}
+	t.Logf("conflicting location rejected at start: %v", err)
+
+	if _, err := r.Wait(planA.ID); err != nil {
+		t.Fatalf("wait plan-a: %v", err)
+	}
+	// 前一个结束后，冲突规则依旧成立（不能因为槽位空了就允许不同计划接管状态）。
+	err = r.Start(context.Background(), planB)
+	if !errors.Is(err, ErrPlanLocationConflict) {
+		t.Fatalf("want ErrPlanLocationConflict after first run finished, got %v", err)
+	}
+	t.Logf("conflicting location still rejected after first run finished: %v", err)
+
+	// 同一 ID 续跑复用同一落点是合法的，不得被冲突规则误伤。
+	if err := r.Start(context.Background(), planA); err != nil {
+		t.Fatalf("same-plan resume should be allowed: %v", err)
+	}
+	if _, err := r.Wait(planA.ID); err != nil {
+		t.Fatalf("wait plan-a resume: %v", err)
+	}
+}
+
+// TestRunnerUnsafePlanIDRejected 计划 ID 不适合落盘时，Start 必须直接拒绝
+// 并说清原因，运行绝不被发起（随后查询应表现为未发起）。
+func TestRunnerUnsafePlanIDRejected(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRunner(NewSimExecutor(simScripts(nil)), WithStateDir(dir))
+	plan := testPlan(testTarget("t1", false))
+	plan.ID = "bad\x00plan"
+	err := r.Start(context.Background(), plan)
+	if !errors.Is(err, ErrPlanIDUnsafe) {
+		t.Fatalf("want ErrPlanIDUnsafe, got %v", err)
+	}
+	t.Logf("unsafe plan id rejected at start: %v", err)
+	if _, perr := r.Progress(plan.ID); !errors.Is(perr, ErrPlanNotStarted) {
+		t.Fatalf("rejected plan must not be registered as started, got %v", perr)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("rejected start must not create state files, found %v", entries)
 	}
 }

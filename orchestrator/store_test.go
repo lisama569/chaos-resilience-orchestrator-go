@@ -77,3 +77,57 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 	t.Logf("file store round-trip ok: phase=%s done=%v", got.Targets["t"].Phase, got.Targets["t"].Done)
 }
+
+// TestClonePlanStateDeepCopy 覆盖业务：状态在锁内改完、锁外落盘期间，
+// 下一次变更绝不能写进正在落盘的副本（否则 race 下会出现写一半的状态文件）。
+func TestClonePlanStateDeepCopy(t *testing.T) {
+	ps := &PlanState{
+		PlanID:    "p1",
+		AttemptID: "p1#1",
+		EventSeq:  2,
+		Targets: map[string]*TargetState{
+			"t1": {
+				ID:            "t1",
+				Phase:         PhaseProbing,
+				Verdict:       VerdictSteady,
+				Cleanup:       CleanupSucceeded,
+				FaultInjected: true,
+				Done:          []StepDone{{Name: "inject"}},
+				Events: []Event{
+					{Seq: 1, Kind: "a", Detail: map[string]any{"ok": true}},
+					{Seq: 2, Kind: "b"},
+				},
+			},
+		},
+	}
+	cp := clonePlanState(ps)
+	if cp == ps {
+		t.Fatal("clone shares top-level PlanState with original")
+	}
+	if cp.Targets["t1"] == ps.Targets["t1"] {
+		t.Fatal("clone shares TargetState pointer with original")
+	}
+
+	// 对原状态做后续变更：追加事件、改阶段、改已完成步骤、改详情。
+	st := ps.Targets["t1"]
+	st.Phase = PhaseCompleted
+	st.Events[0].Detail["ok"] = false
+	st.Events = append(st.Events, Event{Seq: 3, Kind: "c"})
+	st.Done = append(st.Done, StepDone{Name: "probe"})
+
+	c := cp.Targets["t1"]
+	if c.Phase != PhaseProbing {
+		t.Fatalf("clone phase mutated: %s", c.Phase)
+	}
+	if len(c.Events) != 2 {
+		t.Fatalf("clone events aliased, len=%d", len(c.Events))
+	}
+	if c.Events[0].Detail["ok"] != true {
+		t.Fatalf("clone event detail aliased: %v", c.Events[0].Detail)
+	}
+	if len(c.Done) != 1 {
+		t.Fatalf("clone done slice aliased, len=%d", len(c.Done))
+	}
+	t.Logf("deep clone isolated from subsequent mutation: %d events, %d done steps",
+		len(c.Events), len(c.Done))
+}

@@ -25,9 +25,17 @@ type Engine struct {
 	now       func() time.Time
 	logf      Logger
 
-	stateMu sync.Mutex
+	// stateMu 只保护内存状态：动作线程持写锁做状态变更，进度查询持读锁
+	// 做一致快照。锁内绝不做磁盘 I/O，因此查询不会被写盘拖住，高频查询
+	// 也只会在读锁上排队，不串行化动作执行。
+	stateMu sync.RWMutex
 	state   *PlanState
 	running bool // 是否有正在执行的动作（供运行期进度查询）
+
+	// persistMu 串行化状态落盘本身，保证多次变更按发生顺序到达磁盘，
+	// 后一次落盘不会被先一次慢落盘反超。它与 stateMu 独立：查询从不获取
+	// 它，动作线程在锁外等待写盘时，查询仍可即时读取内存状态。
+	persistMu sync.Mutex
 }
 
 // Option 配置引擎。
@@ -67,12 +75,26 @@ func (e *Engine) newAttemptID(planID string) string {
 	return fmt.Sprintf("%s#%d", planID, e.now().UnixNano())
 }
 
-// mutate 在持锁状态下修改状态并立即持久化，保证崩溃恢复边界清晰。
+// mutate 在写锁内修改内存状态，随后在锁外持久化。
+//
+// 并发模型（查询是纯只读旁观者）：
+//   - 状态变更在 stateMu 写锁下完成，临界区只有内存赋值，不含任何 I/O，
+//     因而既不会被正在写盘的线程拖住，也不会拖住并发的进度查询；
+//   - 持久化使用独立的 persistMu 串行化：持锁顺序恒为
+//     stateMu -> persistMu（从不同时反向持有），且落盘内容是锁边界处
+//     深拷贝出的快照，避免与后续变更共享底层数组；
+//   - persistMu 保证落盘顺序与变更顺序一致（慢写盘不会反超），
+//     磁盘上永远是某个已提交时刻的完整一致状态，配合原子 rename，
+//     任何时刻读到的文件都不是写一半的内容。
 func (e *Engine) mutate(fn func()) error {
 	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
 	fn()
-	if err := e.store.Save(e.state); err != nil {
+	snapshot := clonePlanState(e.state)
+	e.stateMu.Unlock()
+
+	e.persistMu.Lock()
+	defer e.persistMu.Unlock()
+	if err := e.store.Save(snapshot); err != nil {
 		return fmt.Errorf("%w: %v", ErrPersistFailed, err)
 	}
 	return nil
@@ -397,8 +419,8 @@ func (e *Engine) sampleFunc(ctx context.Context, spec TargetSpec, probes []Probe
 }
 
 func (e *Engine) resultOf(st *TargetState) TargetResult {
-	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
 	evs := make([]Event, len(st.Events))
 	copy(evs, st.Events)
 	return TargetResult{

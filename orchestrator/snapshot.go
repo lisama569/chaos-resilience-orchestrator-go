@@ -41,8 +41,8 @@ type PlanProgress struct {
 //   - 锁内只做内存拷贝，不做任何 I/O，因此查询本身不会拖慢正在执行的动作；
 //   - 引擎尚未开始运行（从未调用 Run）时返回 Started=false 的零值视图。
 func (e *Engine) Snapshot() PlanProgress {
-	e.stateMu.Lock()
-	defer e.stateMu.Unlock()
+	e.stateMu.RLock()
+	defer e.stateMu.RUnlock()
 
 	p := PlanProgress{Running: e.running}
 	if e.state == nil {

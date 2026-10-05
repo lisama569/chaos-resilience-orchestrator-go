@@ -124,6 +124,59 @@ func (ps *PlanState) AppendEvent(at time.Time, targetID, kind string, detail map
 	return ev
 }
 
+// clonePlanState 深拷贝整个计划状态，使锁外落盘的副本与后续状态变更
+// 不共享任何 map/slice 底层内存，杜绝“边写盘边改”导致的数据竞争或
+// 半更新内容到达磁盘。
+func clonePlanState(ps *PlanState) *PlanState {
+	if ps == nil {
+		return nil
+	}
+	cp := &PlanState{
+		PlanID:    ps.PlanID,
+		AttemptID: ps.AttemptID,
+		EventSeq:  ps.EventSeq,
+		UpdatedAt: ps.UpdatedAt,
+		Targets:   make(map[string]*TargetState, len(ps.Targets)),
+	}
+	for id, st := range ps.Targets {
+		cp.Targets[id] = cloneTargetState(st)
+	}
+	return cp
+}
+
+// cloneTargetState 深拷贝单个目标状态（含已完成步骤、事件与事件详情）。
+func cloneTargetState(st *TargetState) *TargetState {
+	if st == nil {
+		return nil
+	}
+	cp := &TargetState{
+		ID:            st.ID,
+		AttemptID:     st.AttemptID,
+		Phase:         st.Phase,
+		Verdict:       st.Verdict,
+		Failure:       st.Failure,
+		FailureDetail: st.FailureDetail,
+		Cleanup:       st.Cleanup,
+		HealRounds:    st.HealRounds,
+		FaultInjected: st.FaultInjected,
+		UpdatedAt:     st.UpdatedAt,
+		Done:          make([]StepDone, len(st.Done)),
+		Events:        make([]Event, len(st.Events)),
+	}
+	copy(cp.Done, st.Done)
+	for i, ev := range st.Events {
+		cp.Events[i] = ev
+		if ev.Detail != nil {
+			d := make(map[string]any, len(ev.Detail))
+			for k, v := range ev.Detail {
+				d[k] = v
+			}
+			cp.Events[i].Detail = d
+		}
+	}
+	return cp
+}
+
 // FileStore 以单个 JSON 文件持久化状态；写入采用临时文件+原子改名，
 // 避免进程在写入中途被杀死留下损坏的状态文件。
 type FileStore struct {

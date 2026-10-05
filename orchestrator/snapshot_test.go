@@ -2,7 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -208,5 +211,86 @@ func TestSnapshotIsolation(t *testing.T) {
 	}
 	if v, ok := tp.Events[0].Detail["ok"]; ok && v == "tampered" {
 		t.Fatal("engine event detail polluted by snapshot mutation")
+	}
+}
+
+// TestSnapshotNotBlockedBySlowDisk 在每次状态落盘都显著变慢（真实文件
+// 存储 + 人为延迟，非内存桩）的条件下验证：
+//   - 写盘进行中 Snapshot 仍必须即时返回一致视图（不等写盘）；
+//   - 同一引擎的落盘严格串行（不允许两个 Save 重叠写出交错内容）；
+//   - 高频查询不改变最终结果。
+func TestSnapshotNotBlockedBySlowDisk(t *testing.T) {
+	store := newSlowFileStore(filepath.Join(t.TempDir(), "slow.state.json"), 40*time.Millisecond)
+
+	var targets []TargetSpec
+	for i := 0; i < 4; i++ {
+		targets = append(targets, testTarget(fmt.Sprintf("t%d", i), true)) // 走自愈链路，事件密集
+	}
+	plan := testPlan(targets...)
+	plan.Concurrency = 4
+	eng := NewEngine(NewSimExecutor(simScripts(nil)), store, WithLogger(t.Logf))
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = eng.Run(context.Background(), plan)
+		close(done)
+	}()
+
+	var queries int
+	var maxSnapDuration time.Duration
+waitLoop:
+	for {
+		select {
+		case <-done:
+			break waitLoop
+		default:
+		}
+		start := time.Now()
+		p := eng.Snapshot()
+		d := time.Since(start)
+		if d > maxSnapDuration {
+			maxSnapDuration = d
+		}
+		// 落盘耗时 40ms；快照是锁内纯内存拷贝，给宽限也必须远小于一次写盘。
+		if d > 20*time.Millisecond {
+			t.Fatalf("snapshot blocked behind disk write: took %v", d)
+		}
+		checkSnapshotInvariants(t, p)
+		queries++
+	}
+
+	if queries == 0 {
+		t.Fatal("no snapshot executed during slow-disk run")
+	}
+	saves, maxActive := store.stats()
+	if maxActive > 1 {
+		t.Fatalf("persistence not serialized: observed %d concurrent saves", maxActive)
+	}
+	t.Logf("slow-disk run: saves=%d (max concurrent=%d), snapshots=%d, worst snapshot latency=%v",
+		saves, maxActive, queries, maxSnapDuration)
+	if maxSnapDuration >= 20*time.Millisecond {
+		t.Fatalf("query latency should stay well below one disk write, worst=%v", maxSnapDuration)
+	}
+
+	// 磁盘上的最终状态文件必须可解析且与最终快照一致（没有写一半的内容）。
+	data, err := os.ReadFile(store.inner.(*FileStore).path)
+	if err != nil {
+		t.Fatalf("read final state file: %v", err)
+	}
+	var ps PlanState
+	if err := json.Unmarshal(data, &ps); err != nil {
+		t.Fatalf("final state file corrupt: %v", err)
+	}
+	final := eng.Snapshot()
+	if len(ps.Targets) != len(final.Targets) {
+		t.Fatalf("disk targets %d != snapshot targets %d", len(ps.Targets), len(final.Targets))
+	}
+	for _, tp := range final.Targets {
+		st := ps.Targets[tp.TargetID]
+		if st == nil || st.Phase != tp.Phase || st.Verdict != tp.Verdict ||
+			st.Cleanup != tp.Cleanup || st.Failure != tp.Failure ||
+			len(st.Events) != len(tp.Events) {
+			t.Fatalf("disk/snapshot mismatch for %s: disk=%+v snap=%+v", tp.TargetID, st, tp)
+		}
 	}
 }
